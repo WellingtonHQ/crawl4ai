@@ -22,7 +22,7 @@ class MonitorStats:
 
         # In-memory queues (fast reads, Redis backup)
         self.active_requests: Dict[str, Dict] = {}  # id -> request info
-        self.completed_requests: deque = deque(maxlen=100)  # Last 100
+        self.completed_requests: deque = deque(maxlen=5000)  # Last 5000 (24h retention)
         self.janitor_events: deque = deque(maxlen=100)
         self.errors: deque = deque(maxlen=100)
 
@@ -121,8 +121,8 @@ class MonitorStats:
             "details": details
         })
 
-    def _cleanup_old_entries(self, max_age_seconds: int = 300):
-        """Remove entries older than max_age_seconds (default 5min)."""
+    def _cleanup_old_entries(self, max_age_seconds: int = 86400):
+        """Remove entries older than max_age_seconds (default 24h)."""
         now = time.time()
         cutoff = now - max_age_seconds
 
@@ -143,8 +143,8 @@ class MonitorStats:
         now = time.time()
         mem_pct = get_container_memory_percent()
 
-        # Clean old entries (keep last 5 minutes)
-        self._cleanup_old_entries(max_age_seconds=300)
+        # Clean old entries (keep last 24 hours)
+        self._cleanup_old_entries(max_age_seconds=86400)
 
         # Count requests in last 5s
         recent_reqs = sum(1 for req in self.completed_requests
