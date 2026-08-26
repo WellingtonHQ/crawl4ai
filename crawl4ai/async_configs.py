@@ -762,7 +762,11 @@ class BrowserConfig:
         extra_args (list): Additional command-line arguments passed to the browser.
                            Default: [].
         enable_stealth (bool): If True, applies playwright-stealth to bypass basic bot detection.
-                              Cannot be used with use_undetected browser mode. Default: False.
+                               Cannot be used with use_undetected browser mode. Default: False.
+        use_undetected (bool): If True (default), use the stealthy patchright engine
+                               (UndetectedAdapter) instead of plain Playwright. Set to
+                               False to opt back out to the standard PlaywrightAdapter.
+                               Default: True.
         memory_saving_mode (bool): If True, adds aggressive cache discard and V8 heap cap flags
                                    to reduce Chromium memory growth. Recommended for high-volume
                                    crawling (1000+ pages). May slightly reduce performance due to
@@ -824,6 +828,7 @@ class BrowserConfig:
         debugging_port: int = 9222,
         host: str = "localhost",
         enable_stealth: bool = False,
+        use_undetected: bool = True,
         avoid_ads: bool = False,
         avoid_css: bool = False,
         init_scripts: List[str] = None,
@@ -891,6 +896,7 @@ class BrowserConfig:
         self.debugging_port = debugging_port
         self.host = host
         self.enable_stealth = enable_stealth
+        self.use_undetected = use_undetected
         self.avoid_ads = avoid_ads
         self.avoid_css = avoid_css
         self.init_scripts = init_scripts if init_scripts is not None else []
@@ -986,6 +992,7 @@ class BrowserConfig:
             "debugging_port": self.debugging_port,
             "host": self.host,
             "enable_stealth": self.enable_stealth,
+            "use_undetected": self.use_undetected,
             "avoid_ads": self.avoid_ads,
             "avoid_css": self.avoid_css,
             "init_scripts": self.init_scripts,

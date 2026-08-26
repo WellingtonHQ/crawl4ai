@@ -7,8 +7,25 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, Any, List, Union
 from typing import Optional, AsyncGenerator, Final
 import os
-from playwright.async_api import Page, Error
+from playwright.async_api import Page
+from playwright.async_api import Error
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+# patchright is a separate package with its own (non-compatible) exception
+# classes. A browser launched via patchright raises patchright.* errors, so the
+# ``except`` clauses below must catch both families. TimeoutError is a subclass
+# of Error in each package, so catching the base Error of both covers timeouts.
+try:
+    from patchright.async_api import Error as _PrError
+    from patchright.async_api import TimeoutError as _PrTimeoutError
+except Exception:  # pragma: no cover - patchright optional
+    _PrError = Error
+    _PrTimeoutError = PlaywrightTimeoutError
+
+# Unified exception tuples covering both playwright and patchright. Use these in
+# ``except`` clauses so errors raised by either engine are handled identically.
+BrowserError = (Error, _PrError)
+BrowserTimeoutError = (PlaywrightTimeoutError, _PrTimeoutError)
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import hashlib
@@ -32,6 +49,29 @@ from urllib.parse import urlparse
 from types import MappingProxyType
 import contextlib
 from functools import partial
+
+def _patchright_available() -> bool:
+    """Return True if the stealthy patchright engine can be imported."""
+    try:
+        import patchright.async_api  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _default_adapter(browser_config: BrowserConfig) -> BrowserAdapter:
+    """Pick the default browser adapter.
+
+    Defaults to the stealthy patchright-based UndetectedAdapter (which evades
+    anti-bot / Cloudflare gates far better than vanilla Playwright). Falls back
+    to the standard PlaywrightAdapter when patchright is not installed or the
+    user has opted out via ``BrowserConfig(use_undetected=False)``.
+    """
+    use_undetected = getattr(browser_config, "use_undetected", True)
+    if use_undetected and _patchright_available():
+        return UndetectedAdapter()
+    return PlaywrightAdapter()
+
 
 class AsyncCrawlerStrategy(ABC):
     """
@@ -91,8 +131,10 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         # Initialize with default logger if none provided to prevent NoneType errors
         self.logger = logger if logger is not None else AsyncLogger(verbose=False)
         
-        # Initialize browser adapter
-        self.adapter = browser_adapter or PlaywrightAdapter()
+        # Initialize browser adapter. Defaults to the stealthy patchright
+        # (UndetectedAdapter) engine; pass browser_adapter=PlaywrightAdapter()
+        # or BrowserConfig(use_undetected=False) to opt back to vanilla Playwright.
+        self.adapter = browser_adapter or _default_adapter(self.browser_config)
 
         # Initialize session management
         self._downloaded_files = []
@@ -260,7 +302,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             css_selector = wait_for[4:].strip()
             try:
                 await page.wait_for_selector(css_selector, timeout=timeout)
-            except Error as e:
+            except BrowserError as e:
                 if "Timeout" in str(e):
                     raise TimeoutError(
                         f"Timeout after {timeout}ms waiting for selector '{css_selector}'"
@@ -276,7 +318,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 # Assume it's a CSS selector first
                 try:
                     await page.wait_for_selector(wait_for, timeout=timeout)
-                except Error as e:
+                except BrowserError as e:
                     if "Timeout" in str(e):
                         raise TimeoutError(
                             f"Timeout after {timeout}ms waiting for selector '{wait_for}'"
@@ -288,7 +330,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             return await self.csp_compliant_wait(
                                 page, f"() => {{{wait_for}}}", timeout
                             )
-                        except Error:
+                        except BrowserError:
                             raise ValueError(
                                 f"Invalid wait_for parameter: '{wait_for}'. "
                                 "It should be either a valid CSS selector, a JavaScript function, "
@@ -764,7 +806,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         )
                         redirected_url = page.url
                         redirected_status_code = response.status if response else None
-                    except Error as e:
+                    except BrowserError as e:
                         # Allow navigation to be aborted when downloading files
                         # This is expected behavior for downloads in some browser engines
                         if 'net::ERR_ABORTED' in str(e) and self.browser_config.accept_downloads:
@@ -830,7 +872,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     visibility_info = await self.check_visibility(page)
                     raise Error(f"Body element is hidden: {visibility_info}")
 
-            except Error:
+            except BrowserError:
                 visibility_info = await self.check_visibility(page)
 
                 if self.browser_config.verbose:
@@ -858,7 +900,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
             #     """,
             #         timeout=30000,
             #     )
-            # except Error as e:
+            # except BrowserError as e:
             #     visibility_info = await page.evaluate(
             #         """
             #         () => {
@@ -1027,7 +1069,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                 try:
                     try:
                         await page.wait_for_load_state("domcontentloaded", timeout=5)
-                    except PlaywrightTimeoutError:
+                    except BrowserTimeoutError:
                         pass
                     await self.adapter.evaluate(page, update_image_dimensions_js)
                 except Exception as e:
@@ -1075,11 +1117,11 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                                     .join('')"""
                             )
                             html_parts.append(content)
-                        except Error as e:
+                        except BrowserError as e:
                             print(f"Warning: Could not get content for selector '{selector}': {str(e)}")
 
                     html = f"<div class='crawl4ai-result'>\n" + "\n".join(html_parts) + "\n</div>"
-                except Error as e:
+                except BrowserError as e:
                     raise RuntimeError(f"Failed to extract HTML content: {str(e)}")
             else:
                 html = await page.content()
@@ -1632,7 +1674,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         });
                     })
                 """)
-            except Error as e:
+            except BrowserError as e:
                 if self.logger:
                     self.logger.warning(
                         message="Wait for load state timed out: {error}",
@@ -2083,7 +2125,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                         }})();
                         """
                         )
-                    except Error as e:
+                    except BrowserError as e:
                         # If it's due to navigation destroying the context, handle gracefully
                         if "Execution context was destroyed" in str(e):
                             self.logger.info(
@@ -2092,7 +2134,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                             )
                             try:
                                 await page.wait_for_load_state("load", timeout=30000)
-                            except Error as nav_err:
+                            except BrowserError as nav_err:
                                 self.logger.warning(
                                     message="Navigation wait failed: {error}",
                                     tag="JS_EXEC",
@@ -2102,7 +2144,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                                 await page.wait_for_load_state(
                                     "networkidle", timeout=30000
                                 )
-                            except Error as nav_err:
+                            except BrowserError as nav_err:
                                 self.logger.warning(
                                     message="Network idle wait failed: {error}",
                                     tag="JS_EXEC",
@@ -2126,7 +2168,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     t1 = time.time()
                     try:
                         await page.wait_for_load_state("domcontentloaded", timeout=5000)
-                    except Error as e:
+                    except BrowserError as e:
                         self.logger.warning(
                             message="DOM content load timeout: {error}",
                             tag="JS_EXEC",
@@ -2137,7 +2179,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     # try:
                     #     await page.wait_for_load_state('networkidle', timeout=5000)
                     #     print("Network idle after script execution in", time.time() - t1)
-                    # except Error as e:
+                    # except BrowserError as e:
                     #     self.logger.warning(
                     #         message="Network idle timeout: {error}",
                     #         tag="JS_EXEC",
@@ -2239,7 +2281,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
 
                     results.append(result if result else {"success": True})
 
-                except Error as e:
+                except BrowserError as e:
                     # Handle Playwright-specific errors
                     self.logger.error(
                         message="Playwright execution error: {error}",

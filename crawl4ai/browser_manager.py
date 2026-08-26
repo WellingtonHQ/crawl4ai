@@ -1131,14 +1131,13 @@ class BrowserManager:
                 DeprecationWarning,
             )
         if self.config.proxy_config:
-            from playwright.async_api import ProxySettings
-
-            proxy_settings = ProxySettings(
-                server=self.config.proxy_config.server,
-                username=self.config.proxy_config.username,
-                password=self.config.proxy_config.password,
-            )
-            browser_args["proxy"] = proxy_settings
+            # Use a plain dict (not playwright's ProxySettings) so the same
+            # browser_args work with both the playwright and patchright engines.
+            browser_args["proxy"] = {
+                "server": self.config.proxy_config.server,
+                "username": self.config.proxy_config.username,
+                "password": self.config.proxy_config.password,
+            }
 
         return browser_args
 
@@ -1336,13 +1335,13 @@ class BrowserManager:
         if crawlerRunConfig:
             # Check if there is value for crawlerRunConfig.proxy_config set add that to context
             if crawlerRunConfig.proxy_config:
-                from playwright.async_api import ProxySettings
-                proxy_settings = ProxySettings(
-                    server=crawlerRunConfig.proxy_config.server,
-                    username=crawlerRunConfig.proxy_config.username,
-                    password=crawlerRunConfig.proxy_config.password,
-                )
-                context_settings["proxy"] = proxy_settings
+                # Plain dict (not playwright's ProxySettings) so it works with
+                # both the playwright and patchright engines.
+                context_settings["proxy"] = {
+                    "server": crawlerRunConfig.proxy_config.server,
+                    "username": crawlerRunConfig.proxy_config.username,
+                    "password": crawlerRunConfig.proxy_config.password,
+                }
 
         if self.config.text_mode:
             text_mode_settings = {
