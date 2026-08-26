@@ -584,7 +584,7 @@ async def get_markdown(
             400, "Invalid URL format. Must start with http://, https://, or for raw HTML (raw:, raw://)")
     # base_url is intentionally not accepted from the request (key-exfil vector);
     # the LLM endpoint is server-derived from the provider name only.
-    markdown = await handle_markdown_request(
+    markdown, title = await handle_markdown_request(
         body.url, body.f, body.q, body.c, config, body.provider,
         body.temperature
     )
@@ -594,6 +594,7 @@ async def get_markdown(
         "query": body.q,
         "cache": body.c,
         "markdown": markdown,
+        "title": title,
         "success": True
     })
 

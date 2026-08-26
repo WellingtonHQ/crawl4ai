@@ -330,8 +330,13 @@ async def handle_markdown_request(
     provider: Optional[str] = None,
     temperature: Optional[float] = None,
     base_url: Optional[str] = None
-) -> str:
-    """Handle markdown generation requests."""
+) -> tuple[str, Optional[str]]:
+    """Handle markdown generation requests.
+
+    Returns (markdown, title). title is result.metadata.title (the page's
+    <title>/og:title) or None when the page has none — callers fall back to
+    their own heuristics.
+    """
     crawler = None
     try:
         # Validate provider if using LLM filter
@@ -395,9 +400,12 @@ async def handle_markdown_request(
                 detail=result.error_message
             )
 
-        return (result.markdown.raw_markdown
-               if filter_type == FilterType.RAW
-               else result.markdown.fit_markdown)
+        metadata = result.metadata or {}
+        title = metadata.get("title")
+        markdown = (result.markdown.raw_markdown
+                    if filter_type == FilterType.RAW
+                    else result.markdown.fit_markdown)
+        return markdown, title
 
     except HTTPException:
         raise
