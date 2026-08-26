@@ -196,6 +196,12 @@ COPY deploy/docker/* ${APP_HOME}/
 # copy the playground + any future static assets
 COPY deploy/docker/static ${APP_HOME}/static
 
+# LLM reasoning-effort hook (Qwen3.8 thinking control): the .pth auto-imports
+# c4ai_llm_thinking at interpreter startup, wrapping LLMContentFilter.__init__
+# to inject extra_body. No-op unless LLM_REASONING_EFFORT is set.
+COPY deploy/docker/llm-hook/c4ai_llm_thinking.py /usr/local/lib/python3.12/site-packages/c4ai_llm_thinking.py
+COPY deploy/docker/llm-hook/zz_c4ai_llm.pth /usr/local/lib/python3.12/site-packages/zz_c4ai_llm.pth
+
 # /app is root-owned and read-only to the runtime user: a write bug can no
 # longer plant a persistent self-RCE in the application directory.
 RUN chown -R root:root ${APP_HOME} && chmod -R a-w ${APP_HOME}
