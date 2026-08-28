@@ -83,8 +83,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 \
     libasound2 \
     libatspi2.0-0 \
-    && apt-get clean \ 
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# nodriver stealth worker browser stack: apt chromium + a virtual framebuffer.
+# Headful Chromium on Xvfb is the default: CF managed "Just a moment"
+# interstitials do not clear in plain headless on this stack, but resolve in
+# ~10-30s with a real X display (supervisord runs Xvfb on :99, DISPLAY=:99).
+# openbox/xdotool + baseline fonts follow the proven cloak-browser pattern
+# (fontconfig + emoji/CJK font layers keep canvas-hash fingerprints sane).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
+    xvfb \
+    xdotool \
+    openbox \
+    fontconfig \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-unifont \
+    fonts-freefont-ttf \
+    fonts-ipafont-gothic \
+    fonts-wqy-zenhei \
+    fonts-tlwg-loma-otf \
+    fonts-urw-base35 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f >/dev/null 2>&1 || true
 
 RUN apt-get update && apt-get dist-upgrade -y \
     && rm -rf /var/lib/apt/lists/*
@@ -190,6 +214,41 @@ RUN crawl4ai-doctor
 RUN mkdir -p /home/appuser/.cache \
     && chown -R appuser:appuser /home/appuser/.cache
 
+# ── nodriver stealth worker (AGPL-3.0, process-isolated) ────────────────────
+# nodriver is AGPL-3.0: it lives ONLY in this worker's own venv and is
+# imported ONLY by worker.py (supervisord program "nodriver-worker"). The
+# crawl4ai package and the main API never import it — AGPL isolation by
+# process + network boundary (separate venv, port 8001 reachable only via an
+# explicit -p mapping or the internal docker network).
+# The built image therefore contains an AGPL component: keep it private.
+# See deploy/docker/nodriver_worker/LICENSE-NOTICE.md.
+RUN python3 -m venv /opt/nodriver-worker
+COPY deploy/docker/nodriver_worker/requirements.txt /tmp/nodriver-worker-requirements.txt
+RUN /opt/nodriver-worker/bin/pip install --no-cache-dir -r /tmp/nodriver-worker-requirements.txt \
+    && /opt/nodriver-worker/bin/python - <<'EOF'
+# nodriver 0.50.3 ships nodriver/cdp/network.py with a stray cp1252 0xB1 byte
+# (a '±' inside a comment) that is invalid UTF-8 and breaks `import nodriver`
+# on every Python 3. Fix: encode the ± properly (0xC2 0xB1).
+import pathlib
+
+import nodriver
+
+p = pathlib.Path(nodriver.__file__).parent / "cdp" / "network.py"
+d = p.read_bytes()
+if b"\xb1Inf" in d:
+    p.write_bytes(d.replace(b"\xb1Inf", b"\xc2\xb1Inf"))
+    print("patched nodriver/cdp/network.py (invalid UTF-8 byte -> U+00B1)")
+import nodriver as _n  # noqa: F401  — prove the import works now
+print("nodriver import OK")
+EOF
+COPY deploy/docker/nodriver_worker/worker.py deploy/docker/nodriver_worker/run.sh /opt/nodriver-worker/
+# The venv dir doubles as the worker's CWD (supervisord `directory=`): nodriver's
+# verify_cf/template_location writes screen.jpg + cf_template.png into the CWD
+# and SILENTLY swallows PermissionError (returns None -> TypeError upstream).
+# Root-owned CWD therefore disables CF checkbox verification entirely — make it
+# appuser-writable. (Subdirs stay root-owned/readable; only the top dir is written.)
+RUN chmod +x /opt/nodriver-worker/run.sh && chown appuser:appuser /opt/nodriver-worker
+
 # Copy application code
 COPY deploy/docker/* ${APP_HOME}/
 
@@ -226,6 +285,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # Redis is in-container only (loopback + requirepass); never expose its port.
 # (was: EXPOSE 6379)
+# nodriver stealth worker: container-internal on port 8001 (not publicly
+# exposed); map it to a host port only if the operator wants to reach it.
+EXPOSE 8001
 # Switch to the non-root user before starting the application
 USER appuser
 
