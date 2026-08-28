@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import asyncio
 from typing import List, Tuple, Dict
 from functools import partial
@@ -358,6 +359,28 @@ _STEALTH_ERROR_MARKERS = _STEALTH_MARKERS + (
 )
 
 
+def _compile_markers(markers) -> "re.Pattern":
+    """Word-boundary-aware marker matcher.
+
+    Plain substring matching false-positives on e.g. "recaptcha" (contains
+    "captcha" but is not a challenge). Anchoring tokens with \\b keeps real
+    challenge text matching while letting pass-through references go.
+    """
+    parts = []
+    for marker in markers:
+        esc = re.escape(marker)
+        if marker and marker[0].isalnum():
+            esc = r"\b" + esc
+        if marker and marker[-1].isalnum():
+            esc = esc + r"\b"
+        parts.append(esc)
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+_STEALTH_MARKER_RE = _compile_markers(_STEALTH_MARKERS)
+_STEALTH_ERROR_RE = _compile_markers(_STEALTH_ERROR_MARKERS)
+
+
 def _stealth_enabled() -> bool:
     v = os.environ.get("NODRIVER_STEALTH_ENABLED")
     return (v or "true").strip().lower() not in ("false", "0", "no", "off")
@@ -379,11 +402,9 @@ def _looks_like_bot_wall(
         return True
     head = (markdown or "").strip()
     if head:
-        low = head[:4000].lower()
-        return any(m in low for m in _STEALTH_MARKERS)
+        return _STEALTH_MARKER_RE.search(head[:4000]) is not None
     if status_code:
-        detail = (error_detail or "").lower()
-        return any(m in detail for m in _STEALTH_ERROR_MARKERS)
+        return _STEALTH_ERROR_RE.search(error_detail or "") is not None
     return True  # success but empty markdown
 
 

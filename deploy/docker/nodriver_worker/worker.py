@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -77,9 +78,30 @@ _CHALLENGE_MARKERS = (
 )
 
 
+def _compile_markers(markers) -> "re.Pattern":
+    """Word-boundary-aware marker matcher.
+
+    Plain substring matching false-positives on e.g. "recaptcha.net" inside a
+    CSP entry (contains "captcha" but is not a challenge). Anchoring single
+    tokens with \\b keeps real challenge text ("px-captcha", standalone
+    "Captcha") matching while letting pass-through references go.
+    """
+    parts = []
+    for marker in markers:
+        esc = re.escape(marker)
+        if marker and marker[0].isalnum():
+            esc = r"\b" + esc
+        if marker and marker[-1].isalnum():
+            esc = esc + r"\b"
+        parts.append(esc)
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+_CHALLENGE_RE = _compile_markers(_CHALLENGE_MARKERS)
+
+
 def _looks_like_challenge(html: str) -> bool:
-    low = html[:6000].lower()
-    return any(marker in low for marker in _CHALLENGE_MARKERS)
+    return _CHALLENGE_RE.search(html[:6000]) is not None
 
 
 def _to_markdown(html: str) -> str:
