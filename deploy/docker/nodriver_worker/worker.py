@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import quote_plus, urlparse
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -102,6 +103,79 @@ _CHALLENGE_RE = _compile_markers(_CHALLENGE_MARKERS)
 
 def _looks_like_challenge(html: str) -> bool:
     return _CHALLENGE_RE.search(html[:6000]) is not None
+
+
+# Walmart serves missing item pages as a full 200 soft-404 shell ("We couldn't
+# find this page") — the product was re-listed under a new ID. The shell is a
+# complete page, so plain extraction would store it as ok content. Detect it
+# and recover the canonical item URL via walmart search instead.
+_WALMART_404_RE = re.compile(r"we couldn.{0,2}t find this page", re.IGNORECASE)
+
+
+def _is_walmart_item_404(url: str, html: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.netloc.lower() not in ("walmart.com", "www.walmart.com"):
+        return False
+    if not parsed.path.startswith("/ip/"):
+        return False
+    return _WALMART_404_RE.search(html[:20000]) is not None
+
+
+def _slug_tokens(slug: str) -> set:
+    return {t for t in re.split(r"[-_]+", slug.lower()) if len(t) > 1}
+
+
+async def _walmart_recover_item_url(tab, url: str) -> "str | None":
+    """Find the canonical walmart item URL for a soft-404 item page.
+
+    Searches walmart with the slug's keywords and returns the best-matching
+    item link (slug + numeric id) whose slug shares enough tokens with the
+    original slug. Returns None when the search yields no plausible match.
+    """
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    if len(parts) < 2:
+        return None
+    orig_tokens = _slug_tokens(parts[1])
+    if len(orig_tokens) < 3:
+        return None
+    query = " ".join(parts[1].split("-")[:8])
+    search_url = "https://www.walmart.com/search?q=" + quote_plus(query)
+    await tab.get(search_url)
+    await tab.wait(4.0)
+    raw = await tab.evaluate(
+        """(() => {
+          const seen = new Set();
+          const out = [];
+          document.querySelectorAll('a[href*="/ip/"]').forEach((a) => {
+            const m = (a.getAttribute('href') || '').match(/\\/ip\\/([^/?#]+)\\/([0-9]+)/);
+            if (m && !seen.has(m[1] + '/' + m[2])) { seen.add(m[1] + '/' + m[2]); out.push(m[1] + '/' + m[2]); }
+          });
+          return JSON.stringify(out);
+        })()""",
+        return_by_value=True,
+    )
+    if not isinstance(raw, str):
+        return None
+    try:
+        candidates = json.loads(raw)
+    except ValueError:
+        return None
+    best = None
+    best_score = 0.0
+    for cand in candidates:
+        cand_tokens = _slug_tokens(cand.split("/")[0])
+        if not cand_tokens:
+            continue
+        overlap = len(orig_tokens & cand_tokens)
+        if overlap < 3:
+            continue
+        score = overlap / min(len(orig_tokens), len(cand_tokens))
+        if score > best_score:
+            best, best_score = cand, score
+    return f"https://www.walmart.com/ip/{best}" if best else None
 
 
 def _to_markdown(html: str) -> str:
@@ -217,6 +291,22 @@ async def _crawl_tab(tab, url: str) -> dict:
 
     await tab.wait(1.0)  # let post-challenge redirect/render settle
     html = await tab.get_content()
+
+    # Walmart soft-404 shell: the item was re-listed under a new ID. Recover
+    # the canonical item URL via search rather than storing the shell.
+    if _is_walmart_item_404(url, html):
+        log.info("walmart item page is a 404 shell — recovering via search: %s", url)
+        recovered = await _walmart_recover_item_url(tab, url)
+        if recovered is None:
+            return {"url": url, "markdown": "", "title": None, "success": False,
+                    "error": "walmart item page is a 404 shell and no matching item was found in search"}
+        log.info("recovered walmart item: %s", recovered)
+        await tab.get(recovered)
+        await tab.wait(SETTLE_S + 1.5)
+        html = await tab.get_content()
+        if _is_walmart_item_404(recovered, html):
+            return {"url": url, "markdown": "", "title": None, "success": False,
+                    "error": f"walmart item 404 shell (recovered item also missing: {recovered})"}
 
     title = None
     try:
