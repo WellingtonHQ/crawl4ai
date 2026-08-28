@@ -109,19 +109,75 @@ def _looks_like_challenge(html: str) -> bool:
 # find this page") — the product was re-listed under a new ID. The shell is a
 # complete page, so plain extraction would store it as ok content. Detect it
 # and recover the canonical item URL via walmart search instead.
-_WALMART_404_RE = re.compile(r"we couldn.{0,2}t find this page", re.IGNORECASE)
+# Anchor to the visible <h1>: the strings "We couldn't find this page" and
+# "item404Title" also appear in walmart's site-wide JS config bundle on
+# perfectly good item pages, so plain text matching false-positives there.
+_WALMART_404_RE = re.compile(
+    r">we couldn.{0,2}t find this page</h1>", re.IGNORECASE
+)
 
 
-def _is_walmart_item_404(url: str, html: str) -> bool:
+def _is_walmart_item_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
     except ValueError:
         return False
-    if parsed.netloc.lower() not in ("walmart.com", "www.walmart.com"):
+    return (
+        parsed.netloc.lower() in ("walmart.com", "www.walmart.com")
+        and parsed.path.startswith("/ip/")
+    )
+
+
+def _is_walmart_item_404(url: str, html: str) -> bool:
+    if not _is_walmart_item_url(url):
         return False
-    if not parsed.path.startswith("/ip/"):
-        return False
-    return _WALMART_404_RE.search(html[:20000]) is not None
+    # The 404 h1 sits deep in the shell (~130k chars in) — scan the full page.
+    return _WALMART_404_RE.search(html) is not None
+
+
+async def _walmart_offer_line(tab, md: str) -> str:
+    """Ensure the main product's offer (price / availability) is captured.
+
+    The readability/trafilatura hybrid sometimes keeps the related-products
+    grid but drops the buy box, leaving the page's own price out of the
+    markdown. When that happens, prepend the hero price read from the DOM.
+    """
+    try:
+        raw = await tab.evaluate(
+            """(() => {
+              const q = (sel) => { const e = document.querySelector(sel); return e ? e.innerText.trim() : null; };
+              const hero = q('[data-seo-id="hero-price"]');
+              const was = q('[data-seo-id="strike-through-price"]');
+              let stock = null;
+              const leaf = Array.from(document.querySelectorAll('span, li, p')).find(
+                (e) => e.children.length === 0
+                  && /^(in stock|out of stock|only \\d+ left|unavailable|not available)/i.test((e.textContent || '').trim()));
+              if (leaf) stock = leaf.textContent.trim();
+              return JSON.stringify({ hero, was, stock });
+            })()""",
+            return_by_value=True,
+        )
+    except Exception as e:
+        log.warning("walmart offer lookup failed: %r", e)
+        return md
+    if not isinstance(raw, str):
+        return md
+    try:
+        offer = json.loads(raw)
+    except ValueError:
+        return md
+    hero = (offer.get("hero") or "").strip()
+    if not hero:
+        return md
+    price_num = re.sub(r"[^0-9.]", "", hero)
+    if price_num and price_num in md:
+        return md  # the markdown already carries the main price
+    bits = [hero]
+    if offer.get("was"):
+        bits.append("Was " + offer["was"])
+    if offer.get("stock"):
+        bits.append(offer["stock"])
+    return "**Price:** " + " · ".join(bits) + "\n\n" + md
 
 
 def _slug_tokens(slug: str) -> set:
@@ -320,6 +376,8 @@ async def _crawl_tab(tab, url: str) -> dict:
     if not md.strip():
         return {"url": url, "markdown": "", "title": title, "success": False,
                 "error": "empty markdown"}
+    if _is_walmart_item_url(url):
+        md = await _walmart_offer_line(tab, md)
     return {"url": url, "markdown": md, "title": title, "success": True,
             "challenge_cleared": challenge_seen}
 
