@@ -90,6 +90,8 @@ from webhook import WebhookDeliveryService
 
 import psutil, time
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # --- Helper to get memory ---
@@ -321,6 +323,96 @@ async def process_llm_extraction(
             error=str(e)
         )
 
+# ── nodriver stealth fallback ──────────────────────────────────────────
+# When the primary (patchright) crawl trips a bot wall — Cloudflare/Akamai
+# interstitial, 403/429/503, or empty markdown — retry the URL ONCE against
+# the in-image nodriver stealth worker (supervisord program `nodriver-worker`,
+# POST /md {"url"} -> {"url","markdown","title","success"}). AGPL isolation:
+# the main API only ever talks to the worker over loopback HTTP and never
+# imports nodriver. The caller's response shape is unchanged: on worker
+# success the worker's markdown/title are returned, on worker failure the
+# original primary result/error is kept.
+_STEALTH_BOT_WALL_STATUSES = (403, 429, 503)
+_STEALTH_MARKERS = (
+    "just a moment",
+    "attention required",
+    "challenge-platform",
+    "cf-chl",
+    "pardon our interruption",
+    "continue shopping",
+    "captcha",
+    "robot check",
+    "type the characters",
+    "enter the characters",
+)
+# Extra markers for the engine's own failure text (this stack reports CF/Akamai
+# trips as e.g. "Blocked by anti-bot protection: Cloudflare JS challenge").
+# Broader on purpose: they are only matched against error details of a failed
+# crawl, never against page content.
+_STEALTH_ERROR_MARKERS = _STEALTH_MARKERS + (
+    "cloudflare",
+    "anti-bot",
+    "bot protection",
+    "js challenge",
+    "akamai",
+)
+
+
+def _stealth_enabled() -> bool:
+    v = os.environ.get("NODRIVER_STEALTH_ENABLED")
+    return (v or "true").strip().lower() not in ("false", "0", "no", "off")
+
+
+def _looks_like_bot_wall(
+    status_code: Optional[int],
+    markdown: Optional[str],
+    error_detail: Optional[str] = None,
+) -> bool:
+    """True when the failure shape is a bot wall, not an ordinary error.
+
+    status_code 500/None + empty markdown distinguishes "crawl failed"
+    (decided by the error text) from "crawl succeeded but produced nothing"
+    (always retried). DNS/404/SSRF failures carry no bot-wall marker and
+    never trigger a stealth retry.
+    """
+    if status_code in _STEALTH_BOT_WALL_STATUSES:
+        return True
+    head = (markdown or "").strip()
+    if head:
+        low = head[:4000].lower()
+        return any(m in low for m in _STEALTH_MARKERS)
+    if status_code:
+        detail = (error_detail or "").lower()
+        return any(m in detail for m in _STEALTH_ERROR_MARKERS)
+    return True  # success but empty markdown
+
+
+async def _stealth_worker_fetch(url: str) -> Optional[tuple[str, Optional[str]]]:
+    """Retry `url` once against the nodriver stealth worker.
+
+    Returns (markdown, title) on success, or None when the worker is
+    disabled, unreachable, or reports failure — the caller keeps the
+    original primary result. Never raises, never changes the error shape.
+    """
+    if not _stealth_enabled():
+        return None
+    worker_url = os.environ.get("NODRIVER_WORKER_URL", "http://127.0.0.1:8001/md")
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=95.0) as client:
+            resp = await client.post(worker_url, json={"url": url})
+        data = resp.json()
+    except Exception as e:
+        logger.warning("stealth worker unavailable for %s: %r", url, e)
+        return None
+    markdown = (data.get("markdown") or "").strip()
+    if not data.get("success") or not markdown:
+        logger.warning("stealth worker failed for %s: %s", url, data.get("error"))
+        return None
+    logger.info("stealth tier served %s (%d ms)", url, int((time.time() - t0) * 1000))
+    return data.get("markdown"), data.get("title")
+
+
 async def handle_markdown_request(
     url: str,
     filter_type: FilterType,
@@ -395,6 +487,10 @@ async def handle_markdown_request(
         )
 
         if not result.success:
+            if _looks_like_bot_wall(500, None, result.error_message):
+                fallback = await _stealth_worker_fetch(decoded_url)
+                if fallback is not None:
+                    return fallback
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=result.error_message
@@ -405,6 +501,10 @@ async def handle_markdown_request(
         markdown = (result.markdown.raw_markdown
                     if filter_type == FilterType.RAW
                     else result.markdown.fit_markdown)
+        if _looks_like_bot_wall(None, markdown):
+            fallback = await _stealth_worker_fetch(decoded_url)
+            if fallback is not None:
+                return fallback
         return markdown, title
 
     except HTTPException:
