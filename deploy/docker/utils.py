@@ -171,13 +171,31 @@ class CRLFSafeFilter(logging.Filter):
 
 
 def setup_logging(config: Dict) -> None:
-    """Configure application logging with CRLF-safe records."""
-    logging.basicConfig(
-        level=config["logging"]["level"],
-        format=config["logging"]["format"]
-    )
+    """Configure application logging with CRLF-safe records.
+
+    Authoritative on purpose: a module-level ``logging.info()`` before this
+    runs (e.g. load_config() in crawler_pool.py, which imports before
+    server.py calls setup_logging) triggers CPython's implicit
+    ``basicConfig()`` — a root handler at WARNING. A later explicit
+    ``logging.basicConfig(level=INFO)`` is then a NO-OP (root already has a
+    handler), silently pinning every level-less logger at WARNING and
+    dropping INFO records (observed: "stealth tier served" lines vanished).
+    So set the level and format explicitly instead of relying on basicConfig.
+    """
+    root = logging.getLogger()
+    root.setLevel(config["logging"]["level"])
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(config["logging"]["format"]))
+        root.addHandler(handler)
+    else:
+        # The implicit basicConfig() handler carries the default BASIC_FORMAT
+        # formatter (not None), so overwrite it with the configured format.
+        for h in root.handlers:
+            if isinstance(h, logging.StreamHandler):
+                h.setFormatter(logging.Formatter(config["logging"]["format"]))
     crlf = CRLFSafeFilter()
-    for handler in logging.getLogger().handlers:
+    for handler in root.handlers:
         handler.addFilter(crlf)
 
 def get_base_url(request: Request) -> str:

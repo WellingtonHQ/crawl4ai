@@ -175,7 +175,14 @@ async def _crawl_tab(tab, url: str) -> dict:
                 log.warning("debug screenshot failed: %r", e)
         await _click_turnstile_checkbox(tab)  # closed-shadow-root widget: click at computed coords
         try:
-            await tab.verify_cf()
+            # verify_cf does a CDP screenshot + cv2 match that can HANG on a
+            # page mid-challenge (observed on boardgamegeek: it ate the entire
+            # 60s crawl budget after a single checkbox click, so the poll loop
+            # never got a chance to re-click). The click above already went
+            # through — cap verify_cf so the loop keeps polling/re-clicking.
+            await asyncio.wait_for(tab.verify_cf(), timeout=15)
+        except asyncio.TimeoutError:
+            log.warning("verify_cf timed out for %s — continuing (checkbox click already sent)", url)
         except Exception as e:  # no checkbox match, CDP error — keep waiting anyway
             log.warning("verify_cf failed: %r", e)
         if loop.time() + CHALLENGE_POLL_S > deadline:
