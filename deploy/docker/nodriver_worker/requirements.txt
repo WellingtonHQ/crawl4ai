@@ -1,0 +1,8 @@
+nodriver==0.50.3
+fastapi>=0.115
+uvicorn[standard]>=0.30
+trafilatura>=1.12
+readability-lxml>=0.9
+markdownify>=1.1
+opencv-python-headless>=4.10
+numpy>=1.26
