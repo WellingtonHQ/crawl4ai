@@ -27,6 +27,12 @@ if ! headless; then
     fi
 fi
 
+# CF challenges on hard sites (github.com turnstile) clear slower than the
+# 25s in-code default; give them 45s and stretch the overall crawl budget to
+# match (both stay overridable via the same env vars worker.py reads).
+export NODRIVER_CHALLENGE_TIMEOUT_S="${NODRIVER_CHALLENGE_TIMEOUT_S:-45}"
+export NODRIVER_CRAWL_TIMEOUT_S="${NODRIVER_CRAWL_TIMEOUT_S:-90}"
+
 # Bind 0.0.0.0 INSIDE the container (same posture as the proven cfbridge
 # sidecar on 0.0.0.0:8000): a 127.0.0.1 bind is unreachable through docker
 # port mapping (-p 18001:8001) or from other containers on the network,

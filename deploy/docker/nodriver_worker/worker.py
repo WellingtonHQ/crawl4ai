@@ -23,6 +23,10 @@ import json
 import logging
 import os
 import re
+import signal
+import socket
+import time
+import urllib.request
 from urllib.parse import quote_plus, urlparse
 
 from fastapi import FastAPI
@@ -53,6 +57,11 @@ CHALLENGE_POLL_S = 5.0
 CHROME_PATH = os.environ.get("NODRIVER_CHROME_PATH", "/usr/bin/chromium")
 USER_DATA_DIR = os.environ.get("NODRIVER_USER_DATA_DIR", "/tmp/nodriver-worker-profile")
 DEBUG = _flag("NODRIVER_DEBUG", False)
+# Budget for the initial Chromium cold start (profile creation, first-run).
+# nodriver's built-in handshake window is ~2.5s (5 x 0.5s) — too tight on
+# slow hosts, and its spawn path orphans the browser on failure. We spawn
+# the browser ourselves and poll for this long instead.
+BROWSER_START_TIMEOUT_S = float(os.environ.get("NODRIVER_BROWSER_START_TIMEOUT_S", "60"))
 
 _BROWSER: Browser | None = None
 _SEM = asyncio.Semaphore(MAX_PARALLEL)
@@ -382,6 +391,50 @@ async def _crawl_tab(tab, url: str) -> dict:
             "challenge_cleared": challenge_seen}
 
 
+def _reap_orphans() -> None:
+    """Kill any leftover Chromium holding our profile and drop its lock.
+
+    A crash-loop iteration (nodriver's built-in spawn orphans the browser
+    when the ~2.5s handshake window expires) leaves a live chromium with the
+    profile's SingletonLock; the next spawn then hangs on the locked profile
+    and the loop self-perpetuates. The marker is unique to this worker's
+    profile dir, so matching on it is safe.
+    """
+    marker = f"--user-data-dir={USER_DATA_DIR}"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                cmd = f.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if marker in cmd and "chrom" in cmd:
+            try:
+                os.kill(int(entry), signal.SIGKILL)
+                log.warning("reaped orphaned chromium pid=%s", entry)
+            except OSError:
+                pass
+    lock = os.path.join(USER_DATA_DIR, "SingletonLock")
+    if os.path.islink(lock) or os.path.exists(lock):
+        try:
+            os.unlink(lock)
+            log.warning("removed stale profile SingletonLock")
+        except OSError:
+            pass
+
+
+async def _devtools_version(port: int) -> dict:
+    """Poll DevTools /json/version; raises until Chromium is answering."""
+    def _get() -> dict:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json/version", timeout=2
+        ) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    return await asyncio.to_thread(_get)
+
+
 async def lifespan(_app: FastAPI):
     global _BROWSER
     if not STEALTH_ENABLED:
@@ -390,29 +443,98 @@ async def lifespan(_app: FastAPI):
         return
     log.info("starting pooled browser (headless=%s, chrome=%s, display=%s)",
              HEADLESS, CHROME_PATH, os.environ.get("DISPLAY"))
-    _BROWSER = await Browser.create(
-        headless=HEADLESS,
-        browser_executable_path=CHROME_PATH,
-        user_data_dir=USER_DATA_DIR,
-        sandbox=False,  # container runs as appuser in a rootfs where chrome's setuid sandbox is unavailable
-        browser_args=[
+    _reap_orphans()
+
+    # Spawn Chromium ourselves so we own the process handle: poll DevTools
+    # until it is actually ready (up to BROWSER_START_TIMEOUT_S) and kill it
+    # on any failure. Then hand nodriver the host+port so it takes the
+    # connect-existing path instead of spawning on its own ~2.5s handshake
+    # window (which is too tight on slow hosts and orphans the browser on
+    # failure).
+    proc: asyncio.subprocess.Process | None = None
+    port: int | None = None
+    try:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        args = [
+            CHROME_PATH,
+            f"--user-data-dir={USER_DATA_DIR}",
+            "--disable-session-crashed-bubble",
+            "--disable-features=IsolateOrigins,site-per-process",
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--window-size=1366,900",
             "--lang=en-US",
-        ],
-    )
-    proc = getattr(_BROWSER, "_process", None)
-    log.info("browser up (pid=%s)", getattr(proc, "pid", None))
+            # container runs as appuser in a rootfs where chrome's setuid
+            # sandbox is unavailable
+            "--no-sandbox",
+        ]
+        if HEADLESS:
+            args.append("--headless=new")
+        args += [
+            "--remote-debugging-host=127.0.0.1",
+            f"--remote-debugging-port={port}",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        info = None
+        deadline = time.monotonic() + BROWSER_START_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if proc.returncode is not None:
+                raise RuntimeError(f"chromium exited early (rc={proc.returncode})")
+            try:
+                info = await _devtools_version(port)
+            except Exception:
+                info = None
+            if info:
+                break
+            await asyncio.sleep(0.5)
+        if not info:
+            raise RuntimeError(
+                f"DevTools did not come up on 127.0.0.1:{port} "
+                f"within {BROWSER_START_TIMEOUT_S:.0f}s"
+            )
+        from nodriver.core.config import Config
+        _BROWSER = await Browser.create(
+            config=Config(
+                user_data_dir=USER_DATA_DIR,
+                headless=HEADLESS,
+                browser_executable_path=CHROME_PATH,
+                sandbox=False,
+                host="127.0.0.1",
+                port=port,
+            )
+        )
+    except Exception:
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+        raise
+    log.info("browser up (pid=%s)", proc.pid if proc else None)
     try:
         yield
     finally:
         log.info("stopping browser")
-        try:
-            _BROWSER.stop()
-        except Exception as e:
-            log.warning("browser stop: %r", e)
-        _BROWSER = None
+        if _BROWSER is not None:
+            try:
+                _BROWSER.stop()
+            except Exception as e:
+                log.warning("browser stop: %r", e)
+            _BROWSER = None
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
 
 
 app = FastAPI(title="nodriver_worker", lifespan=lifespan)

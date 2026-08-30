@@ -420,7 +420,7 @@ async def _stealth_worker_fetch(url: str) -> Optional[tuple[str, Optional[str]]]
     worker_url = os.environ.get("NODRIVER_WORKER_URL", "http://127.0.0.1:8001/md")
     t0 = time.time()
     try:
-        async with httpx.AsyncClient(timeout=95.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(worker_url, json={"url": url})
         data = resp.json()
     except Exception as e:
